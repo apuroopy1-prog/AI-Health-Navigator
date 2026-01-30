@@ -7,9 +7,12 @@ from datetime import datetime
 from typing import List, Optional
 from io import BytesIO
 
-# Load environment variables
-from dotenv import load_dotenv
-load_dotenv()
+# Load environment variables (optional)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not required on Streamlit Cloud
 
 # For Streamlit Cloud secrets
 if hasattr(st, 'secrets'):
