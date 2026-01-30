@@ -1,0 +1,25 @@
+# AWS App Runner Configuration
+# Simpler alternative to ECS for quick deployment
+
+version: 1.0
+runtime: python311
+
+build:
+  commands:
+    build:
+      - pip install -r requirements.txt
+
+run:
+  command: streamlit run app.py --server.port=8080 --server.address=0.0.0.0 --server.headless=true
+  network:
+    port: 8080
+    env: PORT
+  env:
+    - name: ENVIRONMENT
+      value: "production"
+    - name: MONGODB_URI
+      value: "${MONGODB_URI}"
+    - name: PINECONE_API_KEY
+      value: "${PINECONE_API_KEY}"
+    - name: AWS_REGION
+      value: "us-east-1"

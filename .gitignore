@@ -1,0 +1,51 @@
+# Secrets
+service-account-key.json
+*.pem
+*.key
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Reports
+reports/*.pdf
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Testing
+.coverage
+.pytest_cache/
+
+# Claude Code
+.claude/

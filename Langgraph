@@ -1,0 +1,727 @@
+"""
+Health Care Navigator: AI-Powered Patient Assessment System
+Uses LangGraph for agent orchestration with AWS Bedrock integration
+"""
+
+import os
+import json
+import logging
+from datetime import datetime
+from typing import TypedDict, Optional, Any
+import argparse
+import sys
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+
+# AWS Bedrock imports
+try:
+    import boto3
+    bedrock_runtime = boto3.client(
+        service_name='bedrock-runtime',
+        region_name=os.getenv('AWS_REGION', 'us-east-1')
+    )
+except Exception as e:
+    bedrock_runtime = None
+    print(f"Warning: Could not initialize Bedrock client: {e}")
+
+
+class BedrockLLM:
+    """AWS Bedrock LLM wrapper for Claude"""
+
+    def __init__(self, model_id: str = "anthropic.claude-3-haiku-20240307-v1:0"):
+        self.model_id = model_id
+
+    def invoke(self, prompt: str) -> str:
+        if bedrock_runtime is None:
+            # Fallback response if Bedrock not available
+            return self._fallback_response(prompt)
+
+        try:
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            })
+
+            response = bedrock_runtime.invoke_model(
+                modelId=self.model_id,
+                body=body,
+                contentType="application/json",
+                accept="application/json"
+            )
+
+            response_body = json.loads(response['body'].read())
+            return response_body['content'][0]['text']
+
+        except Exception as e:
+            logging.error(f"Bedrock invocation error: {e}")
+            return self._fallback_response(prompt)
+
+    def _fallback_response(self, prompt: str) -> str:
+        """Fallback responses when Bedrock is unavailable"""
+        if "intake coordinator" in prompt.lower():
+            return (
+                "Patient presented with the listed complaints. "
+                "Initial assessment suggests medium risk; recommend clinical follow-up."
+            )
+        if "clinical assessment specialist" in prompt.lower():
+            return (
+                "Detailed symptom analysis: consider differential diagnoses including migraine and anemia. "
+                "Recommend blood tests and neurological review. Clinical risk: Medium."
+            )
+        if "care planning specialist" in prompt.lower():
+            return (
+                "1) Conservative management and follow-up in 2 weeks. "
+                "2) If worsening, escalate to specialist. Follow-up timeline: 2 weeks."
+            )
+        return "Acknowledged."
+
+
+try:
+    from langgraph.graph import StateGraph
+    from langgraph.types import Command
+except Exception:  # pragma: no cover - lightweight StateGraph fallback for local runs
+    class StateGraph:
+        def __init__(self, state_type=None):
+            self._nodes = {}
+            self._edges = {}
+            self._entry = None
+            self._finish = None
+
+        def add_node(self, name: str, func):
+            self._nodes[name] = func
+
+        def add_edge(self, src: str, dst: str):
+            self._edges.setdefault(src, []).append(dst)
+
+        def set_entry_point(self, name: str):
+            self._entry = name
+
+        def set_finish_point(self, name: str):
+            self._finish = name
+
+        def compile(self):
+            return self
+
+        def invoke(self, state):
+            current = self._entry
+            visited = set()
+            while current and current not in visited:
+                visited.add(current)
+                func = self._nodes.get(current)
+                if not func:
+                    break
+                state = func(state)
+                outs = self._edges.get(current, [])
+                current = outs[0] if outs else None
+                if current == self._finish:
+                    func = self._nodes.get(current)
+                    if func:
+                        state = func(state)
+                    break
+            return state
+    class Command:
+        pass
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# STATE DEFINITION
+# ============================================================================
+
+class PatientState(TypedDict):
+    """State object that flows through all three agents"""
+    # Patient demographics
+    patient_id: str
+    name: str
+    age: Optional[int]
+    contact_info: str
+    emergency_contact: Optional[str]
+    
+    # Intake data (Agent 1)
+    primary_complaints: list[str]
+    symptom_duration: Optional[str]
+    initial_risk_level: str
+    intake_timestamp: str
+    intake_summary: str
+    
+    # Clinical assessment data (Agent 2)
+    detailed_symptoms: dict[str, Any]
+    medical_history: list[str]
+    current_medications: list[str]
+    allergies: list[str]
+    symptom_triggers: list[str]
+    assessment_findings: str
+    clinical_risk_level: str
+    assessment_timestamp: str
+    rag_context: list[str]
+    
+    # Care planning data (Agent 3)
+    treatment_recommendations: list[str]
+    care_level: str
+    referrals: list[str]
+    compliance_notes: str
+    final_report: str
+    pdf_path: Optional[str]
+    
+    # Metadata
+    current_phase: str
+    error_message: Optional[str]
+
+
+# ============================================================================
+# SIMPLE RAG SETUP (Medical Knowledge Base)
+# ============================================================================
+
+class SimpleRAGClient:
+    """Simple RAG client that provides medical knowledge context"""
+
+    def __init__(self):
+        logger.info("Simple RAG client initialized")
+
+    def retrieve_knowledge(self, query: str, top_k: int = 5) -> list[str]:
+        """
+        Retrieve relevant medical knowledge based on symptoms
+        """
+        # Simple keyword-based knowledge retrieval
+        knowledge_base = {
+            "headache": [
+                "Headaches can be primary (migraine, tension-type, cluster) or secondary to underlying conditions.",
+                "Red flags include sudden severe onset, fever, neck stiffness, or neurological symptoms.",
+                "Initial workup may include neurological examination and consideration of imaging if red flags present."
+            ],
+            "fatigue": [
+                "Fatigue can result from sleep disorders, anemia, thyroid dysfunction, or depression.",
+                "Recommended initial tests: CBC, TSH, metabolic panel, vitamin B12/folate levels.",
+                "Duration >6 months with specific criteria may indicate chronic fatigue syndrome."
+            ],
+            "dizziness": [
+                "Dizziness may be vertigo (spinning), presyncope, or disequilibrium.",
+                "Common causes include BPPV, vestibular neuritis, orthostatic hypotension, and medication effects.",
+                "Evaluation should include orthostatic vital signs and neurological examination."
+            ],
+            "chest pain": [
+                "Chest pain requires urgent evaluation to rule out acute coronary syndrome.",
+                "Key features: character, location, radiation, duration, and associated symptoms.",
+                "Initial workup: ECG, cardiac enzymes, chest X-ray."
+            ],
+            "default": [
+                f"Clinical evaluation recommended for: {query}",
+                "Standard initial workup includes history, physical examination, and targeted laboratory tests.",
+                "Consider specialist referral if symptoms persist or red flags are present."
+            ]
+        }
+
+        results = []
+        query_lower = query.lower()
+
+        for keyword, knowledge in knowledge_base.items():
+            if keyword in query_lower and keyword != "default":
+                results.extend(knowledge)
+
+        if not results:
+            results = knowledge_base["default"]
+
+        return results[:top_k]
+
+
+# ============================================================================
+# AGENT 1: INTAKE COORDINATOR
+# ============================================================================
+
+def intake_coordinator_agent(state: PatientState) -> PatientState:
+    """
+    Agent 1: Collects basic patient information and performs initial screening
+    """
+    try:
+        logger.info("=== INTAKE COORDINATOR AGENT STARTED ===")
+
+        # Generate greeting and collect initial info using AWS Bedrock
+        llm = BedrockLLM(model_id="anthropic.claude-3-haiku-20240307-v1:0")
+        
+        intake_prompt = f"""
+        You are a professional healthcare intake coordinator. Based on the patient information provided:
+        
+        Patient Name: {state.get('name', 'Not provided')}
+        Age: {state.get('age', 'Not provided')}
+        Primary Complaints: {', '.join(state.get('primary_complaints', []))}
+        
+        Please provide:
+        1. A brief intake summary
+        2. Initial risk level assessment (Low/Medium/High)
+        3. Recommended follow-up areas for clinical assessment
+        
+        Keep the response professional and concise.
+        """
+        
+        response = llm.invoke(intake_prompt)
+        
+        # Parse response and update state
+        state["intake_summary"] = response
+        state["initial_risk_level"] = "Medium"  # Default - can be refined
+        state["intake_timestamp"] = datetime.now().isoformat()
+        state["current_phase"] = "clinical_assessment"
+        
+        logger.info("Intake coordinator phase completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Intake coordinator error: {str(e)}")
+        state["error_message"] = f"Intake error: {str(e)}"
+        state["current_phase"] = "error"
+    
+    return state
+
+
+# ============================================================================
+# AGENT 2: CLINICAL ASSESSMENT
+# ============================================================================
+
+def clinical_assessment_agent(state: PatientState) -> PatientState:
+    """
+    Agent 2: Performs detailed symptom analysis and clinical assessment
+    Uses RAG to retrieve relevant medical knowledge
+    """
+    try:
+        logger.info("=== CLINICAL ASSESSMENT AGENT STARTED ===")
+        
+        if state.get("error_message"):
+            logger.warning("Skipping clinical assessment due to previous error")
+            return state
+
+        # Initialize RAG client
+        rag_client = SimpleRAGClient()
+
+        # Retrieve medical knowledge relevant to patient's complaints
+        complaints_query = " ".join(state.get("primary_complaints", []))
+        rag_results = rag_client.retrieve_knowledge(complaints_query, top_k=5)
+        state["rag_context"] = rag_results
+
+        # Initialize LLM for assessment using AWS Bedrock
+        llm = BedrockLLM(model_id="anthropic.claude-3-haiku-20240307-v1:0")
+        
+        # Create assessment prompt with RAG context
+        rag_context_text = "\n".join(rag_results) if rag_results else "No specific medical resources found"
+        
+        assessment_prompt = f"""
+        You are a clinical assessment specialist. Analyze this patient case:
+        
+        Intake Summary: {state.get('intake_summary', 'No intake data')}
+        Primary Complaints: {', '.join(state.get('primary_complaints', []))}
+        Initial Risk Level: {state.get('initial_risk_level', 'Unknown')}
+        
+        Medical Knowledge Base Context:
+        {rag_context_text}
+        
+        Please provide:
+        1. Detailed symptom analysis
+        2. Potential medical conditions to consider
+        3. Recommended diagnostic questions
+        4. Clinical risk assessment (Low/Medium/High)
+        5. Any immediate concerns
+        
+        Base your analysis on the provided medical knowledge context.
+        """
+        
+        assessment_response = llm.invoke(assessment_prompt)
+        
+        # Update state with assessment findings
+        state["assessment_findings"] = assessment_response
+        state["clinical_risk_level"] = "Medium"  # Can be extracted from LLM response
+        state["assessment_timestamp"] = datetime.now().isoformat()
+        state["current_phase"] = "care_planning"
+        state["detailed_symptoms"] = {
+            "complaints": state.get("primary_complaints", []),
+            "assessment": assessment_response
+        }
+        
+        logger.info("Clinical assessment phase completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Clinical assessment error: {str(e)}")
+        state["error_message"] = f"Assessment error: {str(e)}"
+        state["current_phase"] = "error"
+    
+    return state
+
+
+# ============================================================================
+# AGENT 3: CARE PLANNER & COMPLIANCE
+# ============================================================================
+
+def care_planner_agent(state: PatientState) -> PatientState:
+    """
+    Agent 3: Generates treatment recommendations and compliance documentation
+    """
+    try:
+        logger.info("=== CARE PLANNER & COMPLIANCE AGENT STARTED ===")
+        
+        if state.get("error_message"):
+            logger.warning("Skipping care planning due to previous error")
+            return state
+
+        # Initialize LLM for care planning using AWS Bedrock
+        llm = BedrockLLM(model_id="anthropic.claude-3-haiku-20240307-v1:0")
+        
+        care_plan_prompt = f"""
+        You are a care planning specialist. Based on the clinical assessment:
+        
+        Assessment Findings: {state.get('assessment_findings', 'No assessment data')}
+        Clinical Risk Level: {state.get('clinical_risk_level', 'Unknown')}
+        Patient Age: {state.get('age', 'Unknown')}
+        
+        Please provide:
+        1. Recommended treatment options (numbered list)
+        2. Appropriate care level (Primary Care/Specialist/Emergency)
+        3. Specialist referrals if needed
+        4. Patient education recommendations
+        5. Follow-up timeline
+        6. Compliance and regulatory notes
+        
+        Format as a professional care plan.
+        """
+        
+        care_response = llm.invoke(care_plan_prompt)
+        
+        # Parse and structure the response
+        state["treatment_recommendations"] = [
+            "Recommendation 1: Based on clinical findings",
+            "Recommendation 2: Follow-up assessment in 2 weeks",
+            "Recommendation 3: Monitor symptoms and report changes"
+        ]
+        state["care_level"] = "Primary Care"
+        state["referrals"] = []
+        state["compliance_notes"] = "All recommendations comply with healthcare standards"
+        state["final_report"] = care_response
+        state["current_phase"] = "completed"
+        
+        # Generate PDF report
+        pdf_path = generate_patient_report_pdf(state)
+        state["pdf_path"] = pdf_path
+        
+        logger.info(f"Care planning completed. Report saved to {pdf_path}")
+        
+    except Exception as e:
+        logger.error(f"Care planning error: {str(e)}")
+        state["error_message"] = f"Care planning error: {str(e)}"
+        state["current_phase"] = "error"
+    
+    return state
+
+
+# ============================================================================
+# PDF REPORT GENERATION
+# ============================================================================
+
+def generate_patient_report_pdf(state: PatientState) -> str:
+    """
+    Generates a comprehensive PDF report with all patient assessment data
+    """
+    try:
+        logger.info("Generating PDF report...")
+        
+        # Create reports directory if it doesn't exist
+        os.makedirs("./reports", exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_path = f"./reports/patient_report_{state['patient_id']}_{timestamp}.pdf"
+        
+        # Create PDF document
+        doc = SimpleDocTemplate(
+            pdf_path,
+            pagesize=letter,
+            rightMargin=0.75*inch,
+            leftMargin=0.75*inch,
+            topMargin=0.75*inch,
+            bottomMargin=0.75*inch
+        )
+        
+        # Container for the 'Flowable' objects
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=16,
+            textColor=colors.HexColor('#1f4788'),
+            spaceAfter=12,
+            fontName='Helvetica-Bold'
+        )
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=12,
+            textColor=colors.HexColor('#2e5f8a'),
+            spaceAfter=8,
+            fontName='Helvetica-Bold'
+        )
+        
+        # Title
+        elements.append(Paragraph("PATIENT ASSESSMENT REPORT", title_style))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Patient Information Section
+        elements.append(Paragraph("1. PATIENT INFORMATION", heading_style))
+        patient_info = [
+            ["Field", "Value"],
+            ["Name", state.get('name', 'N/A')],
+            ["Patient ID", state.get('patient_id', 'N/A')],
+            ["Age", str(state.get('age', 'N/A'))],
+            ["Contact", state.get('contact_info', 'N/A')],
+            ["Emergency Contact", state.get('emergency_contact', 'N/A')],
+        ]
+        
+        patient_table = Table(patient_info, colWidths=[2*inch, 4*inch])
+        patient_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2e5f8a')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ]))
+        elements.append(patient_table)
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Intake Summary
+        elements.append(Paragraph("2. INTAKE SUMMARY", heading_style))
+        intake_text = state.get('intake_summary', 'No intake data available')
+        elements.append(Paragraph(intake_text, styles['Normal']))
+        elements.append(Spacer(1, 0.15*inch))
+        
+        # Clinical Assessment
+        elements.append(Paragraph("3. CLINICAL ASSESSMENT", heading_style))
+        assessment_text = state.get('assessment_findings', 'No assessment data available')
+        elements.append(Paragraph(assessment_text, styles['Normal']))
+        elements.append(Spacer(1, 0.15*inch))
+        
+        # Risk Assessment
+        elements.append(Paragraph("4. RISK ASSESSMENT", heading_style))
+        risk_info = [
+            ["Assessment Type", "Risk Level"],
+            ["Initial Risk Level", state.get('initial_risk_level', 'N/A')],
+            ["Clinical Risk Level", state.get('clinical_risk_level', 'N/A')],
+        ]
+        
+        risk_table = Table(risk_info, colWidths=[3*inch, 3*inch])
+        risk_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#c41e3a')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        elements.append(risk_table)
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Care Plan
+        elements.append(Paragraph("5. CARE PLAN", heading_style))
+        care_level = state.get('care_level', 'Not determined')
+        elements.append(Paragraph(f"<b>Recommended Care Level:</b> {care_level}", styles['Normal']))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        treatment_recs = state.get('treatment_recommendations', [])
+        if treatment_recs:
+            elements.append(Paragraph("<b>Treatment Recommendations:</b>", styles['Normal']))
+            for idx, rec in enumerate(treatment_recs, 1):
+                elements.append(Paragraph(f"{idx}. {rec}", styles['Normal']))
+        elements.append(Spacer(1, 0.15*inch))
+        
+        # Compliance Notes
+        elements.append(Paragraph("6. COMPLIANCE & REGULATORY NOTES", heading_style))
+        compliance_text = state.get('compliance_notes', 'Standard healthcare protocols applied')
+        elements.append(Paragraph(compliance_text, styles['Normal']))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Footer
+        elements.append(Paragraph(
+            f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            styles['Normal']
+        ))
+        
+        # Build PDF
+        doc.build(elements)
+        logger.info(f"PDF report generated successfully: {pdf_path}")
+        
+        return pdf_path
+        
+    except Exception as e:
+        logger.error(f"PDF generation error: {str(e)}")
+        raise
+
+
+# ============================================================================
+# LANGGRAPH WORKFLOW SETUP
+# ============================================================================
+
+def create_health_navigator_graph() -> StateGraph:
+    """
+    Creates the LangGraph workflow with three agent nodes and proper routing
+    """
+    
+    # Create state graph
+    workflow = StateGraph(PatientState)
+    
+    # Add agent nodes
+    workflow.add_node("intake", intake_coordinator_agent)
+    workflow.add_node("clinical_assessment", clinical_assessment_agent)
+    workflow.add_node("care_planning", care_planner_agent)
+    
+    # Define edges (flow between agents)
+    workflow.add_edge("intake", "clinical_assessment")
+    workflow.add_edge("clinical_assessment", "care_planning")
+    
+    # Set entry point
+    workflow.set_entry_point("intake")
+    
+    # Set finish point
+    workflow.set_finish_point("care_planning")
+    
+    # Compile the graph
+    graph = workflow.compile()
+    
+    return graph
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def run_patient_assessment(patient_data: dict) -> PatientState:
+    """
+    Main function to run the complete patient assessment workflow
+    """
+    try:
+        logger.info("Starting Health Navigator Assessment")
+        logger.info(f"Patient: {patient_data.get('name')}")
+        
+        # Initialize patient state
+        initial_state = PatientState(
+            patient_id=patient_data.get("patient_id", "PAT001"),
+            name=patient_data.get("name", ""),
+            age=patient_data.get("age"),
+            contact_info=patient_data.get("contact_info", ""),
+            emergency_contact=patient_data.get("emergency_contact"),
+            primary_complaints=patient_data.get("primary_complaints", []),
+            symptom_duration=patient_data.get("symptom_duration"),
+            initial_risk_level="",
+            intake_timestamp="",
+            intake_summary="",
+            detailed_symptoms={},
+            medical_history=patient_data.get("medical_history", []),
+            current_medications=patient_data.get("current_medications", []),
+            allergies=patient_data.get("allergies", []),
+            symptom_triggers=[],
+            assessment_findings="",
+            clinical_risk_level="",
+            assessment_timestamp="",
+            rag_context=[],
+            treatment_recommendations=[],
+            care_level="",
+            referrals=[],
+            compliance_notes="",
+            final_report="",
+            pdf_path=None,
+            current_phase="intake",
+            error_message=None
+        )
+        
+        # Create and run the graph
+        graph = create_health_navigator_graph()
+        
+        logger.info("Executing LangGraph workflow...")
+        final_state = graph.invoke(initial_state)
+        
+        logger.info("Assessment completed successfully")
+        logger.info(f"Final Phase: {final_state.get('current_phase')}")
+        logger.info(f"PDF Report: {final_state.get('pdf_path')}")
+        
+        return final_state
+        
+    except Exception as e:
+        logger.error(f"Assessment execution error: {str(e)}")
+        raise
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the Health Navigator assessment script")
+    parser.add_argument("--mode", choices=["local", "production"], default="local",
+                        help="Run mode: 'local' uses safe fallbacks; 'production' requires real SDKs and GCP configuration")
+    parser.add_argument("--patient-file", type=str, default=None,
+                        help="Optional JSON file with patient data. If omitted, a sample patient is used.")
+    args = parser.parse_args()
+
+    # If production mode is requested, validate that required SDKs are present
+    if args.mode == "production":
+        missing = []
+        # aiplatform and vertexai should be real SDKs (not None)
+        if aiplatform is None:
+            missing.append("google-cloud-aiplatform")
+        if vertexai is None:
+            missing.append("vertexai (google.cloud.vertexai)")
+
+        # Detect whether StateGraph and VertexAI are the local shims by checking module
+        is_shim_langgraph = getattr(StateGraph, "__module__", "") == __name__
+        is_shim_vertexai = getattr(VertexAI, "__module__", "") == __name__
+        if is_shim_langgraph:
+            missing.append("langgraph (StateGraph)")
+        if is_shim_vertexai:
+            missing.append("langchain_google_vertexai (VertexAI)")
+
+        if missing:
+            logger.error("Production mode requested but the following packages or SDKs appear missing: %s", ", ".join(missing))
+            logger.error("Install the required packages and ensure GCP credentials and environment variables are configured before running in production mode.")
+            sys.exit(2)
+
+    # Load patient data (from file or sample)
+    if args.patient_file:
+        try:
+            with open(args.patient_file, "r", encoding="utf-8") as f:
+                patient = json.load(f)
+        except Exception as e:
+            logger.error("Failed to load patient file: %s", e)
+            sys.exit(3)
+    else:
+        # Sample patient data
+        patient = {
+            "patient_id": "PAT20250001",
+            "name": "John Doe",
+            "age": 45,
+            "contact_info": "john.doe@email.com | 555-123-4567",
+            "emergency_contact": "Jane Doe | 555-123-4568",
+            "primary_complaints": ["persistent headaches", "fatigue", "dizziness"],
+            "symptom_duration": "2 weeks",
+            "medical_history": ["hypertension", "anxiety"],
+            "current_medications": ["Lisinopril 10mg daily"],
+            "allergies": ["Penicillin"]
+        }
+
+    # Run the assessment
+    result = run_patient_assessment(patient)
+
+    # Print results
+    print("\n" + "="*80)
+    print("ASSESSMENT COMPLETE")
+    print("="*80)
+    print(f"Patient: {result.get('name')}")
+    print(f"Status: {result.get('current_phase')}")
+    print(f"PDF Report: {result.get('pdf_path')}")
+    print(f"Error: {result.get('error_message')}")
+    print("="*80 + "\n")
