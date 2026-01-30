@@ -15,11 +15,13 @@ except ImportError:
     pass  # dotenv not required on Streamlit Cloud
 
 # For Streamlit Cloud secrets
-if hasattr(st, 'secrets'):
+try:
     if 'ANTHROPIC_API_KEY' in st.secrets:
         os.environ['ANTHROPIC_API_KEY'] = st.secrets['ANTHROPIC_API_KEY']
     if 'MONGODB_URI' in st.secrets:
         os.environ['MONGODB_URI'] = st.secrets['MONGODB_URI']
+except Exception:
+    pass  # No secrets file locally, use .env instead
 
 # Import Claude client
 try:
