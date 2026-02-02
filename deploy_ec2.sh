@@ -44,7 +44,7 @@ if [ -d "$APP_DIR" ]; then
 else
     echo -e "${YELLOW}Cloning repository...${NC}"
     cd /home/ec2-user
-    git clone https://github.com/YOUR_USERNAME/AI_Health_Navigator.git
+    git clone https://github.com/apuroopy1-prog/AI-Health-Navigator.git AI_Health_Navigator
     cd $APP_DIR
 fi
 
