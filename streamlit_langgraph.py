@@ -1,17 +1,40 @@
 """
 LangGraph Workflow for AI Health Navigator
-Integrates: LangGraph + Pinecone RAG + MongoDB + AWS Bedrock
+Integrates: LangGraph + Claude API + MongoDB + Streamlit
 """
+import os
 import logging
 from typing import Dict, Any, TypedDict, Annotated, List
 from datetime import datetime
 import operator
 
+# Load environment variables FIRST (before importing clients)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not required on Streamlit Cloud
+
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from database.pinecone_client import pinecone_rag
+# MongoDB client (required)
 from database.mongodb_client import patient_repo, mongo_client
+
+# Pinecone RAG (optional)
+try:
+    from database.pinecone_client import pinecone_rag
+    PINECONE_AVAILABLE = True
+except Exception:
+    PINECONE_AVAILABLE = False
+    pinecone_rag = None
+
+# Claude API client (for AI-powered assessments)
+try:
+    from core.models.claude_client import get_llm_client
+    CLAUDE_AVAILABLE = True
+except Exception:
+    CLAUDE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +76,7 @@ class PatientState(TypedDict):
 def intake_node(state: PatientState) -> Dict[str, Any]:
     """
     Initial intake - gather patient information and perform initial triage.
-    Uses RAG to retrieve relevant medical knowledge.
+    Optionally uses RAG to retrieve relevant medical knowledge.
     """
     logger.info("=== INTAKE NODE ===")
 
@@ -65,12 +88,11 @@ def intake_node(state: PatientState) -> Dict[str, Any]:
     medications = state.get("current_medications", [])
     allergies = state.get("allergies", [])
 
-    # Retrieve relevant medical knowledge using RAG
-    query = " ".join(complaints)
-    rag_results = pinecone_rag.retrieve(query, top_k=5)
-    rag_context = [r.get("content", "") for r in rag_results if r.get("content")]
+    # RAG is disabled for now - will be implemented later with Pinecone
+    # When enabled, this section will retrieve relevant medical knowledge
+    rag_context = []
 
-    # Build intake summary
+    # Build intake summary (clean version without fake RAG references)
     intake_summary = f"""
 **Patient Information:**
 - **Name:** {name}
@@ -91,10 +113,6 @@ The patient presents with the following primary symptoms: {', '.join(complaints)
 
 **Known Allergies:**
 {', '.join(allergies) if allergies else 'No known drug allergies (NKDA).'}
-
-**Relevant Medical Knowledge Retrieved:**
-Based on the patient's symptoms, the following clinical guidelines were consulted:
-{chr(10).join(['- ' + ctx[:200] + '...' if len(ctx) > 200 else '- ' + ctx for ctx in rag_context[:3]]) if rag_context else '- Standard clinical protocols applied.'}
 
 **Initial Triage Assessment:**
 Based on the reported symptoms and patient information, an initial triage assessment has been conducted. The patient's symptoms have been categorized and prioritized according to clinical urgency guidelines.
@@ -165,27 +183,85 @@ def risk_assessment_node(state: PatientState) -> Dict[str, Any]:
 
 def clinical_assessment_node(state: PatientState) -> Dict[str, Any]:
     """
-    Perform detailed clinical assessment using RAG knowledge.
+    Perform detailed clinical assessment using Claude AI.
     """
     logger.info("=== CLINICAL ASSESSMENT NODE ===")
 
     complaints = state.get("primary_complaints", [])
+    name = state.get("name", "Patient")
+    age = state.get("age", 0)
+    duration = state.get("symptom_duration", "Not specified")
+    history = state.get("medical_history", [])
     risk_level = state.get("clinical_risk_level", "Medium")
     care_level = state.get("care_level", "Primary Care")
     rag_context = state.get("rag_context", [])
 
-    # Build clinical assessment using RAG context
-    rag_insights = ""
-    if rag_context:
-        rag_insights = "\n\n**Evidence-Based Clinical Insights:**\n"
-        for i, ctx in enumerate(rag_context[:3], 1):
-            rag_insights += f"\n{i}. {ctx}"
+    # Try to use Claude API for intelligent assessment
+    if CLAUDE_AVAILABLE:
+        try:
+            llm = get_llm_client("sonnet")
 
-    assessment_findings = f"""
+            prompt = f"""You are an expert medical triage AI. Analyze the following patient information and provide a detailed clinical assessment.
+
+PATIENT INFORMATION:
+- Name: {name}
+- Age: {age} years old
+- Primary Symptoms: {', '.join(complaints) if complaints else 'Not specified'}
+- Duration: {duration}
+- Medical History: {', '.join(history) if history else 'None reported'}
+- Initial Risk Level: {risk_level}
+- Recommended Care Level: {care_level}
+
+Please provide a comprehensive clinical assessment with the following sections:
+
+1. SYMPTOM ANALYSIS - Analyze the reported symptoms, their potential significance, and how they may be related.
+
+2. POSSIBLE CONDITIONS - List 3-4 possible conditions that could explain these symptoms with likelihood indicators.
+
+3. RISK FACTORS - Identify any risk factors based on age, medical history, and symptom presentation.
+
+4. RECOMMENDED TESTS - Suggest any diagnostic tests that might be helpful.
+
+5. CLINICAL IMPRESSION - Provide an overall clinical impression and reasoning for the care level recommendation.
+
+Keep your response professional, evidence-based, and remember this is for informational purposes only."""
+
+            ai_assessment = llm.invoke(prompt, temperature=0.3, max_tokens=1500)
+
+            assessment_findings = f"""
+**Clinical Assessment Summary:**
+
+{ai_assessment}
+
+---
+
+**Risk Classification:** {risk_level}
+**Recommended Care:** {care_level}
+"""
+            logger.info("Claude AI assessment completed successfully")
+
+        except Exception as e:
+            logger.warning(f"Claude API error, using fallback: {e}")
+            assessment_findings = _build_fallback_assessment(complaints, risk_level, care_level, rag_context)
+    else:
+        assessment_findings = _build_fallback_assessment(complaints, risk_level, care_level, rag_context)
+
+    return {
+        "assessment_findings": assessment_findings,
+        "current_stage": "assessment_complete",
+        "messages": [{"role": "system", "content": "Clinical assessment completed", "timestamp": datetime.now().isoformat()}]
+    }
+
+
+def _build_fallback_assessment(complaints, risk_level, care_level, rag_context):
+    """Build a fallback assessment when Claude API is not available"""
+    symptoms_text = ', '.join(complaints) if complaints else 'unspecified symptoms'
+
+    return f"""
 **Clinical Assessment Summary:**
 
 **1. Symptom Analysis:**
-The patient reports experiencing {', '.join(complaints) if complaints else 'unspecified symptoms'}. These symptoms warrant clinical attention and have been evaluated based on standard medical assessment protocols and retrieved medical knowledge.
+The patient reports experiencing **{symptoms_text}**. These symptoms warrant clinical attention and have been evaluated based on standard medical assessment protocols.
 
 **2. Risk Stratification:**
 Based on the presented symptoms and patient demographics, the clinical risk has been assessed as **{risk_level}**. This determination considers:
@@ -194,30 +270,23 @@ Based on the presented symptoms and patient demographics, the clinical risk has 
 - Duration and progression of symptoms
 - Presence of any red flag indicators
 - Relevant medical history
-{rag_insights}
 
 **3. Differential Considerations:**
-The reported symptom pattern may be associated with various conditions. A comprehensive evaluation by a qualified healthcare provider is recommended to:
+The reported symptom pattern ({symptoms_text}) may be associated with various conditions. A comprehensive evaluation by a qualified healthcare provider is recommended to:
 - Confirm or rule out potential diagnoses
 - Order appropriate diagnostic tests if indicated
 - Develop a targeted treatment plan
 
 **4. Vital Signs Recommendation:**
 It is recommended to monitor the following parameters:
-- Temperature (for fever assessment)
+- Pain level assessment using standardized scale (1-10)
+- Temperature monitoring
 - Blood pressure and heart rate
-- Respiratory rate and oxygen saturation (if respiratory symptoms present)
-- Pain level assessment using standardized scale
+- Any changes in symptom severity
 
 **5. Clinical Impression:**
 The overall clinical picture suggests a need for {care_level.lower()} evaluation. The patient should be advised regarding warning signs that would necessitate immediate medical attention.
 """
-
-    return {
-        "assessment_findings": assessment_findings,
-        "current_stage": "assessment_complete",
-        "messages": [{"role": "system", "content": "Clinical assessment completed", "timestamp": datetime.now().isoformat()}]
-    }
 
 
 def treatment_planning_node(state: PatientState) -> Dict[str, Any]:
@@ -427,20 +496,29 @@ def run_patient_assessment(patient_data: Dict[str, Any]) -> Dict[str, Any]:
 # ==================== Initialize RAG on Import ====================
 
 def initialize_services():
-    """Initialize Pinecone and MongoDB connections"""
-    try:
-        # Initialize Pinecone RAG
-        pinecone_rag.initialize_index()
-        logger.info("Pinecone RAG initialized")
-    except Exception as e:
-        logger.warning(f"Pinecone initialization failed (using fallback): {e}")
+    """Initialize MongoDB and optionally Pinecone connections"""
+    # Initialize Pinecone RAG (optional)
+    if PINECONE_AVAILABLE and pinecone_rag:
+        try:
+            pinecone_rag.initialize_index()
+            logger.info("Pinecone RAG initialized")
+        except Exception as e:
+            logger.warning(f"Pinecone initialization failed (RAG disabled): {e}")
+    else:
+        logger.info("Pinecone not configured - running without RAG")
 
+    # Initialize MongoDB
     try:
-        # Initialize MongoDB
         mongo_client.connect()
         logger.info("MongoDB connected")
     except Exception as e:
         logger.warning(f"MongoDB connection failed (using local mode): {e}")
+
+    # Log Claude API status
+    if CLAUDE_AVAILABLE:
+        logger.info("Claude API available for AI assessments")
+    else:
+        logger.warning("Claude API not available - using fallback assessments")
 
 
 # Initialize on module load

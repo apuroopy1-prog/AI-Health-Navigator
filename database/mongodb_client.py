@@ -4,7 +4,7 @@ MongoDB Client for Patient Data Persistence
 import os
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 
 from pymongo import MongoClient
@@ -48,7 +48,18 @@ class MongoDBClient:
             True if connected successfully
         """
         try:
-            self._client = MongoClient(self.connection_string)
+            # Configure connection options for Atlas compatibility
+            connection_options = {
+                "serverSelectionTimeoutMS": 5000,
+                "connectTimeoutMS": 10000,
+            }
+
+            # Add TLS options for MongoDB Atlas (Python 3.13 compatibility)
+            if "mongodb+srv" in self.connection_string or "mongodb.net" in self.connection_string:
+                import certifi
+                connection_options["tlsCAFile"] = certifi.where()
+
+            self._client = MongoClient(self.connection_string, **connection_options)
             self._db = self._client[self.database_name]
 
             # Test connection
@@ -56,6 +67,17 @@ class MongoDBClient:
             logger.info(f"Connected to MongoDB: {self.database_name}")
             return True
 
+        except ImportError:
+            # certifi not installed, try without it
+            try:
+                self._client = MongoClient(self.connection_string, serverSelectionTimeoutMS=5000)
+                self._db = self._client[self.database_name]
+                self._client.admin.command('ping')
+                logger.info(f"Connected to MongoDB: {self.database_name}")
+                return True
+            except Exception as e:
+                logger.error(f"MongoDB connection failed: {e}")
+                return False
         except Exception as e:
             logger.error(f"MongoDB connection failed: {e}")
             return False
@@ -157,8 +179,8 @@ class PatientRepository:
         """
         patient = {
             **patient_data,
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc)
         }
 
         # Generate patient_id if not provided
@@ -200,7 +222,7 @@ class PatientRepository:
         Returns:
             True if updated
         """
-        updates["updated_at"] = datetime.utcnow()
+        updates["updated_at"] = datetime.now(timezone.utc)
 
         result = self.patients.update_one(
             {"patient_id": patient_id},
@@ -244,7 +266,7 @@ class PatientRepository:
         assessment = {
             **assessment_data,
             "assessment_id": f"ASM{ObjectId()}",
-            "created_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc)
         }
 
         result = self.assessments.insert_one(assessment)
@@ -299,8 +321,8 @@ class PatientRepository:
         session = {
             **session_data,
             "session_id": f"SES{ObjectId()}",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
             "messages": []
         }
 
@@ -334,14 +356,14 @@ class PatientRepository:
         message = {
             "role": role,
             "content": content,
-            "timestamp": datetime.utcnow()
+            "timestamp": datetime.now(timezone.utc)
         }
 
         result = self.sessions.update_one(
             {"session_id": session_id},
             {
                 "$push": {"messages": message},
-                "$set": {"updated_at": datetime.utcnow()}
+                "$set": {"updated_at": datetime.now(timezone.utc)}
             }
         )
 
@@ -367,7 +389,7 @@ class PatientRepository:
             {
                 "$set": {
                     "state": state,
-                    "updated_at": datetime.utcnow()
+                    "updated_at": datetime.now(timezone.utc)
                 }
             }
         )
@@ -411,8 +433,8 @@ class PatientRepository:
             **appointment_data,
             "appointment_id": f"APT{ObjectId()}",
             "status": appointment_data.get("status", "scheduled"),
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc)
         }
 
         result = self.appointments.insert_one(appointment)
@@ -450,7 +472,7 @@ class PatientRepository:
         Returns:
             True if updated
         """
-        updates["updated_at"] = datetime.utcnow()
+        updates["updated_at"] = datetime.now(timezone.utc)
 
         result = self.appointments.update_one(
             {"appointment_id": appointment_id},
@@ -519,7 +541,7 @@ class PatientRepository:
             List of upcoming appointments
         """
         from datetime import timedelta
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         end_date = now + timedelta(days=days)
 
         query = {
@@ -583,8 +605,8 @@ class PatientRepository:
             **medication_data,
             "medication_id": f"MED{ObjectId()}",
             "is_active": medication_data.get("is_active", True),
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc)
         }
 
         result = self.medications.insert_one(medication)
@@ -605,7 +627,7 @@ class PatientRepository:
         updates: Dict[str, Any]
     ) -> bool:
         """Update medication record."""
-        updates["updated_at"] = datetime.utcnow()
+        updates["updated_at"] = datetime.now(timezone.utc)
 
         result = self.medications.update_one(
             {"medication_id": medication_id},
@@ -663,7 +685,7 @@ class PatientRepository:
         return self.update_medication(medication_id, {
             "is_active": False,
             "discontinued_reason": reason,
-            "discontinued_at": datetime.utcnow()
+            "discontinued_at": datetime.now(timezone.utc)
         })
 
     # ==================== Medication Reminder Operations ====================
@@ -683,7 +705,7 @@ class PatientRepository:
             "reminder_id": f"REM{ObjectId()}",
             "status": reminder_data.get("status", "pending"),
             "email_sent": False,
-            "created_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc)
         }
 
         result = self.medication_reminders.insert_one(reminder)
@@ -707,7 +729,7 @@ class PatientRepository:
             List of upcoming reminders
         """
         from datetime import timedelta
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         end_time = now + timedelta(hours=hours)
 
         reminders = list(
@@ -736,7 +758,7 @@ class PatientRepository:
         Returns:
             List of overdue reminders
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         query = {
             "scheduled_time": {"$lt": now},
             "status": "pending"
@@ -767,7 +789,7 @@ class PatientRepository:
             {"reminder_id": reminder_id},
             {"$set": {
                 "status": "acknowledged",
-                "acknowledged_at": datetime.utcnow()
+                "acknowledged_at": datetime.now(timezone.utc)
             }}
         )
         return result.modified_count > 0
@@ -797,7 +819,7 @@ class PatientRepository:
         patient_id = medication.get("patient_id")
         reminder_ids = []
 
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
         for day_offset in range(days):
             reminder_date = today + timedelta(days=day_offset)
@@ -808,7 +830,7 @@ class PatientRepository:
                     scheduled_time = reminder_date.replace(hour=hour, minute=minute)
 
                     # Only create future reminders
-                    if scheduled_time > datetime.utcnow():
+                    if scheduled_time > datetime.now(timezone.utc):
                         reminder_id = self.create_reminder({
                             "medication_id": medication_id,
                             "patient_id": patient_id,
@@ -840,8 +862,8 @@ class PatientRepository:
             **schedule_data,
             "schedule_id": f"FUS{ObjectId()}",
             "status": schedule_data.get("status", "pending"),
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc)
         }
 
         result = self.follow_up_schedules.insert_one(schedule)
@@ -862,7 +884,7 @@ class PatientRepository:
         updates: Dict[str, Any]
     ) -> bool:
         """Update follow-up schedule."""
-        updates["updated_at"] = datetime.utcnow()
+        updates["updated_at"] = datetime.now(timezone.utc)
 
         result = self.follow_up_schedules.update_one(
             {"schedule_id": schedule_id},
@@ -918,7 +940,7 @@ class PatientRepository:
             List of pending follow-ups
         """
         from datetime import timedelta
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         end_date = now + timedelta(days=days)
 
         query = {
@@ -950,7 +972,7 @@ class PatientRepository:
         Returns:
             List of overdue follow-ups
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         query = {
             "scheduled_date": {"$lt": now},
             "status": "pending"
@@ -985,7 +1007,7 @@ class PatientRepository:
         return self.update_follow_up_schedule(schedule_id, {
             "status": "completed",
             "completed_assessment_id": completed_assessment_id,
-            "completed_at": datetime.utcnow()
+            "completed_at": datetime.now(timezone.utc)
         })
 
     def link_assessments(
@@ -1009,7 +1031,7 @@ class PatientRepository:
             {"$set": {
                 "parent_assessment_id": original_assessment_id,
                 "is_follow_up": True,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.now(timezone.utc)
             }}
         )
         return result.modified_count > 0
@@ -1109,7 +1131,7 @@ class PatientRepository:
         }
 
         days = follow_up_days.get(care_level, 14)
-        scheduled_date = datetime.utcnow() + timedelta(days=days)
+        scheduled_date = datetime.now(timezone.utc) + timedelta(days=days)
 
         schedule_id = self.create_follow_up_schedule({
             "original_assessment_id": assessment_id,
