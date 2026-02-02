@@ -15,6 +15,17 @@ try:
 except ImportError:
     pass  # dotenv not required on Streamlit Cloud
 
+# Load Streamlit Cloud secrets (MUST be before importing database clients)
+try:
+    import streamlit as st
+    if hasattr(st, 'secrets'):
+        if 'ANTHROPIC_API_KEY' in st.secrets:
+            os.environ['ANTHROPIC_API_KEY'] = st.secrets['ANTHROPIC_API_KEY']
+        if 'MONGODB_URI' in st.secrets:
+            os.environ['MONGODB_URI'] = st.secrets['MONGODB_URI']
+except Exception:
+    pass  # Not running in Streamlit context
+
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
